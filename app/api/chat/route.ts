@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
-import { OpenAI } from 'openai'
-import { ChatCompletionMessageParam } from 'openai/resources/chat/completions'
 import { z } from 'zod'
+import { PlanningAgent } from './agents/planningAgent'
+import { WorkflowAgent } from './agents/workflowAgent'
 
 // Validation schemas
 const MessageSchema = z.object({
@@ -9,6 +9,7 @@ const MessageSchema = z.object({
   content: z.string(),
 })
 
+// Request schema
 const RequestSchema = z.object({
   messages: z.array(MessageSchema),
   workflowState: z.object({
@@ -16,123 +17,6 @@ const RequestSchema = z.object({
     edges: z.array(z.any()),
   }),
 })
-
-// Define function schemas with strict typing
-const workflowActions = {
-  addBlock: {
-    description: 'Add one new block to the workflow',
-    parameters: {
-      type: 'object',
-      required: ['type'],
-      properties: {
-        type: {
-          type: 'string',
-          enum: ['agent', 'api', 'condition', 'function', 'router'],
-          description: 'The type of block to add',
-        },
-        name: {
-          type: 'string',
-          description:
-            'Optional custom name for the block. Do not provide a name unless the user has specified it.',
-        },
-        position: {
-          type: 'object',
-          description:
-            'Optional position for the block. Do not provide a position unless the user has specified it.',
-          properties: {
-            x: { type: 'number' },
-            y: { type: 'number' },
-          },
-        },
-      },
-    },
-  },
-  addEdge: {
-    description: 'Create a connection (edge) between two blocks',
-    parameters: {
-      type: 'object',
-      required: ['sourceId', 'targetId'],
-      properties: {
-        sourceId: {
-          type: 'string',
-          description: 'ID of the source block',
-        },
-        targetId: {
-          type: 'string',
-          description: 'ID of the target block',
-        },
-        sourceHandle: {
-          type: 'string',
-          description: 'Optional handle identifier for the source connection point',
-        },
-        targetHandle: {
-          type: 'string',
-          description: 'Optional handle identifier for the target connection point',
-        },
-      },
-    },
-  },
-  removeBlock: {
-    description: 'Remove a block from the workflow',
-    parameters: {
-      type: 'object',
-      required: ['id'],
-      properties: {
-        id: { type: 'string', description: 'ID of the block to remove' },
-      },
-    },
-  },
-  removeEdge: {
-    description: 'Remove a connection (edge) between blocks',
-    parameters: {
-      type: 'object',
-      required: ['id'],
-      properties: {
-        id: { type: 'string', description: 'ID of the edge to remove' },
-      },
-    },
-  },
-}
-
-// System prompt that references workflow state
-const getSystemPrompt = (workflowState: any) => {
-  const blockCount = Object.keys(workflowState.blocks).length
-  const edgeCount = workflowState.edges.length
-
-  // Create a summary of existing blocks
-  const blockSummary = Object.values(workflowState.blocks)
-    .map((block: any) => `- ${block.type} block named "${block.name}" with id ${block.id}`)
-    .join('\n')
-
-  // Create a summary of existing edges
-  const edgeSummary = workflowState.edges
-    .map((edge: any) => `- ${edge.source} -> ${edge.target} with id ${edge.id}`)
-    .join('\n')
-
-  return `You are a workflow assistant that helps users modify their workflow by adding/removing blocks and connections.
-
-Current Workflow State:
-${
-  blockCount === 0
-    ? 'The workflow is empty.'
-    : `${blockSummary}
-
-Connections:
-${edgeCount === 0 ? 'No connections between blocks.' : edgeSummary}`
-}
-
-When users request changes:
-- Consider existing blocks when suggesting connections
-- Provide clear feedback about what actions you've taken
-
-Use the following functions to modify the workflow:
-1. Use the addBlock function to create a new block
-2. Use the addEdge function to connect one block to another
-3. Use the removeBlock function to remove a block
-4. Use the removeEdge function to remove a connection
-
-Only use the provided functions and respond naturally to the user's requests.`
-}
 
 export async function POST(request: Request) {
   try {
@@ -147,52 +31,25 @@ export async function POST(request: Request) {
     const validatedData = RequestSchema.parse(body)
     const { messages, workflowState } = validatedData
 
-    // Initialize OpenAI client
-    const openai = new OpenAI({ apiKey })
+    // Get the latest user message
+    const userMessage = messages[messages.length - 1].content
 
-    // Create message history with workflow context
-    const messageHistory = [
-      { role: 'system', content: getSystemPrompt(workflowState) },
-      ...messages,
-    ]
+    // Initialize agents
+    const planningAgent = new PlanningAgent(apiKey)
+    const workflowAgent = new WorkflowAgent(apiKey)
 
-    // Make OpenAI API call with workflow context
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: messageHistory as ChatCompletionMessageParam[],
-      tools: Object.entries(workflowActions).map(([name, config]) => ({
-        type: 'function',
-        function: {
-          name,
-          description: config.description,
-          parameters: config.parameters,
-        },
-      })),
-      tool_choice: 'auto',
+    // Execute agent pipeline
+    const planningResult = await planningAgent.process({
+      query: userMessage,
+      workflowState,
     })
 
-    const message = completion.choices[0].message
-
-    // Process tool calls if present
-    if (message.tool_calls) {
-      console.log(message.tool_calls)
-      const actions = message.tool_calls.map((call) => ({
-        name: call.function.name,
-        parameters: JSON.parse(call.function.arguments),
-      }))
-
-      return NextResponse.json({
-        message: message.content || "I've updated the workflow based on your request.",
-        actions,
-      })
-    }
-
-    // Return response with no actions
-    return NextResponse.json({
-      message:
-        message.content ||
-        "I'm not sure what changes to make to the workflow. Can you please provide more specific instructions?",
+    const workflowResult = await workflowAgent.process({
+      planningResult,
+      workflowState,
     })
+
+    return NextResponse.json(workflowResult)
   } catch (error) {
     console.error('Chat API error:', error)
 

@@ -16,8 +16,9 @@ export function Chat() {
     e.preventDefault()
     if (!message.trim()) return
 
-    await sendMessage(message)
+    const m = message.trimEnd()
     setMessage('')
+    await sendMessage(m)
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
