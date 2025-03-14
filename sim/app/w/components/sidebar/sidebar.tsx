@@ -37,6 +37,7 @@ export function Sidebar() {
     })
   }, [workflows])
 
+  // Create workflow
   const handleCreateWorkflow = async () => {
     try {
       // Import the isActivelyLoadingFromDB function to check sync status
