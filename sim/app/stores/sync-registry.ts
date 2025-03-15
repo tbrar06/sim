@@ -4,6 +4,8 @@ import { createLogger } from '@/lib/logs/console-logger'
 import { SyncManager } from './sync'
 import { isLocalStorageMode } from './sync-core'
 import { fetchWorkflowsFromDB, workflowSync } from './workflows/sync'
+import { WorkflowYjsProvider } from '@/lib/yjs/provider'
+import { WorkflowYjsBinding } from '@/lib/yjs/workflow-binding'
 
 const logger = createLogger('Sync Registry')
 
@@ -11,6 +13,7 @@ const logger = createLogger('Sync Registry')
 let initialized = false
 let initializing = false
 let managers: SyncManager[] = []
+let yjsBinding: WorkflowYjsBinding | null = null
 
 /**
  * Initialize sync managers and fetch data from DB
@@ -37,19 +40,43 @@ export async function initializeSyncManagers(): Promise<boolean> {
       return true
     }
 
-    // Initialize sync managers
+    // Initialize sync managers first
     managers = [workflowSync]
-
-    // Fetch data from DB
+    
+    // Connect to YJS, but don't initialize binding yet
+    let yjsProvider;
     try {
-      // Remove environment variables fetch
+      yjsProvider = WorkflowYjsProvider.getInstance()
+      await yjsProvider.connect()
+      logger.info('Connected to YJS provider')
+    } catch (error) {
+      logger.error('Failed to connect to YJS:', error)
+    }
+    
+    // Fetch data from database
+    try {
       await fetchWorkflowsFromDB()
+      logger.info('Successfully loaded workflows from database')
     } catch (error) {
       logger.error('Error fetching data from DB:', { error })
     }
 
-    initialized = true
-    return true
+    // Now initialize YJS binding after DB data is loaded
+    if (yjsProvider) {
+      yjsBinding = new WorkflowYjsBinding()
+      
+      // Mark YJS as initialized after a delay to ensure all DB data is processed
+      setTimeout(() => {
+        if (yjsBinding) {
+          yjsBinding.markInitialized()
+          logger.info('YJS binding has been initialized and synchronized')
+        }
+      }, 1000);
+    }
+
+    initialized = true;
+    logger.info('Sync system fully initialized');
+    return true;
   } catch (error) {
     logger.error('Error initializing sync managers:', { error })
     return false
@@ -73,12 +100,24 @@ export function getSyncManagers(): SyncManager[] {
 }
 
 /**
+ * Get YJS binding if available
+ */
+export function getYjsBinding(): WorkflowYjsBinding | null {
+  return yjsBinding
+}
+
+/**
  * Reset all sync managers
  */
 export function resetSyncManagers(): void {
   initialized = false
   initializing = false
   managers = []
+  
+  if (yjsBinding) {
+    yjsBinding.dispose()
+    yjsBinding = null
+  }
 }
 
 // Export individual sync managers for direct use

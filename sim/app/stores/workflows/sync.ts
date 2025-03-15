@@ -9,6 +9,8 @@ import { WorkflowMetadata } from './registry/types'
 import { useSubBlockStore } from './subblock/store'
 import { useWorkflowStore } from './workflow/store'
 import { BlockState } from './workflow/types'
+import { isLocalStorageMode } from '../sync-core'
+import { getYjsBinding } from '../sync-registry'
 
 const logger = createLogger('Workflows Sync')
 
@@ -20,6 +22,12 @@ const LOADING_TIMEOUT = 3000 // 3 seconds maximum loading time
 
 // Track workflows that had scheduling enabled in previous syncs
 const scheduledWorkflows = new Set<string>()
+
+// Track initial load from DB - don't sync if we haven't loaded data yet
+let initialDBLoadComplete = false
+
+// Flag to track if YJS is handling updates
+let yjsSyncing = false
 
 /**
  * Checks if the system is currently in the process of loading data from the database
@@ -103,224 +111,202 @@ async function updateWorkflowSchedule(workflowId: string, state: any): Promise<v
  * This function handles backwards syncing on initialization
  */
 export async function fetchWorkflowsFromDB(): Promise<void> {
-  if (typeof window === 'undefined') return
+  if (isLocalStorageMode()) return
 
   try {
-    // Set flag to prevent sync back to DB during loading
-    isLoadingFromDB = true
-    loadingFromDBToken = 'loading'
-    loadingFromDBStartTime = Date.now()
-
-    // Call the API endpoint to get workflows from DB
-    const response = await fetch(API_ENDPOINTS.WORKFLOW, {
-      method: 'GET',
-    })
-
+    // Set syncing flag to prevent other syncs during this operation
+    yjsSyncing = true;
+    
+    const response = await fetch('/api/db/workflow')
     if (!response.ok) {
-      if (response.status === 401) {
-        logger.warn('User not authenticated for workflow fetch')
-        return
-      }
-
-      logger.error('Failed to fetch workflows:', response.statusText)
-      return
+      throw new Error(`Failed to fetch workflows: ${response.statusText}`)
     }
 
-    const { data } = await response.json()
+    const data = await response.json()
+    const { workflows } = data
 
-    if (!data || !Array.isArray(data) || data.length === 0) {
-      logger.info('No workflows found in database')
-      return
-    }
+    logger.info(`Fetched ${Object.keys(workflows).length} workflows from database`)
 
-    // Get the current active workflow ID before processing
-    const activeWorkflowId = useWorkflowRegistry.getState().activeWorkflowId
+    // Create a unique token for this loading operation to detect when it's complete
+    loadingFromDBToken = crypto.randomUUID()
+    loadingFromDBStartTime = Date.now()
+    isLoadingFromDB = true;
 
-    // Process workflows and update stores
-    const registryWorkflows: Record<string, WorkflowMetadata> = {}
-
-    // Process each workflow from the database
-    data.forEach((workflow) => {
-      const {
-        id,
-        name,
-        description,
-        color,
-        state,
-        lastSynced,
-        isDeployed,
-        deployedAt,
-        apiKey,
-        createdAt,
-      } = workflow
-
-      // 1. Update registry store with workflow metadata
-      registryWorkflows[id] = {
-        id,
-        name,
-        description: description || '',
-        color: color || '#3972F6',
-        // Use createdAt for sorting if available, otherwise fall back to lastSynced
-        lastModified: createdAt ? new Date(createdAt) : new Date(lastSynced),
+    try {
+      // Before updating state, validate that we have actual data
+      if (Object.keys(workflows).length === 0) {
+        logger.warn('No workflows found in database, but continuing initialization');
       }
 
-      // 2. Prepare workflow state data
-      const workflowState = {
-        blocks: state.blocks || {},
-        edges: state.edges || [],
-        loops: state.loops || {},
-        isDeployed: isDeployed || false,
-        deployedAt: deployedAt ? new Date(deployedAt) : undefined,
-        apiKey,
-        lastSaved: Date.now(),
-      }
-
-      // 3. Initialize subblock values from the workflow state
-      const subblockValues: Record<string, Record<string, any>> = {}
-
-      // Extract subblock values from blocks
-      Object.entries(workflowState.blocks).forEach(([blockId, block]) => {
-        const blockState = block as BlockState
-        subblockValues[blockId] = {}
-
-        Object.entries(blockState.subBlocks || {}).forEach(([subblockId, subblock]) => {
-          subblockValues[blockId][subblockId] = subblock.value
-        })
-      })
-
-      // 4. Store the workflow state and subblock values in localStorage
-      // This ensures compatibility with existing code that loads from localStorage
-      localStorage.setItem(`workflow-${id}`, JSON.stringify(workflowState))
-      localStorage.setItem(`subblock-values-${id}`, JSON.stringify(subblockValues))
-
-      // 5. Update subblock store for this workflow
-      useSubBlockStore.setState((state) => ({
-        workflowValues: {
-          ...state.workflowValues,
-          [id]: subblockValues,
-        },
-      }))
-
-      // 6. If this is the active workflow, update the workflow store
-      if (id === activeWorkflowId) {
-        useWorkflowStore.setState(workflowState)
-      }
-
-      // 7. Track if this workflow has scheduling enabled
-      if (hasSchedulingEnabled(workflowState.blocks)) {
-        scheduledWorkflows.add(id)
-      }
-    })
-
-    // 8. Update registry store with all workflows
-    useWorkflowRegistry.setState({ workflows: registryWorkflows })
-
-    // 9. If there's an active workflow that wasn't in the DB data, set a new active workflow
-    if (activeWorkflowId && !registryWorkflows[activeWorkflowId]) {
-      const firstWorkflowId = Object.keys(registryWorkflows)[0]
-      if (firstWorkflowId) {
-        // Load the first workflow as active
-        const workflowState = JSON.parse(
-          localStorage.getItem(`workflow-${firstWorkflowId}`) || '{}'
-        )
-        if (Object.keys(workflowState).length > 0) {
-          useWorkflowStore.setState(workflowState)
-          useWorkflowRegistry.setState({ activeWorkflowId: firstWorkflowId })
+      // Update registry with workflows by updating each workflow individually
+      const registryState = useWorkflowRegistry.getState();
+      
+      // First set active ID to null to prevent state updates during processing
+      registryState.activeWorkflowId && useWorkflowRegistry.setState({ activeWorkflowId: null });
+      
+      // Update/create each workflow in the registry
+      Object.entries(workflows).forEach(([id, workflow]: [string, any]) => {
+        // Skip any malformed workflows
+        if (!workflow || !workflow.name) {
+          logger.warn(`Skipping malformed workflow with ID ${id}`);
+          return;
         }
-      }
-    }
 
-    logger.info('Workflows loaded from DB:', Object.keys(registryWorkflows).length)
-  } catch (error) {
-    logger.error('Error fetching workflows from DB:', { error })
-  } finally {
-    // Reset the flag after a short delay to allow state to settle
-    setTimeout(() => {
-      isLoadingFromDB = false
-      loadingFromDBToken = null
+        // Create workflow metadata
+        const metadata: WorkflowMetadata = {
+          id,
+          name: workflow.name,
+          description: workflow.description || '',
+          color: workflow.color || '#3972F6',
+          lastModified: new Date(workflow.lastSynced || workflow.createdAt || Date.now()),
+        };
+        
+        // Add workflow to registry
+        useWorkflowRegistry.setState((state) => ({
+          workflows: {
+            ...state.workflows,
+            [id]: metadata
+          }
+        }));
+      });
       
-      // Verify if registry has workflows as a final check
-      const registryWorkflows = useWorkflowRegistry.getState().workflows
-      const workflowCount = Object.keys(registryWorkflows).length
-      logger.info(`DB loading complete. Workflows in registry: ${workflowCount}`)
-      
-      // Trigger one final sync to ensure consistency
-      if (workflowCount > 0) {
-        // Small delay for state to fully settle before allowing syncs
-        setTimeout(() => {
-          workflowSync.sync()
-        }, 500)
+      // Set active workflow if we have one
+      const workflowIds = Object.keys(workflows);
+      if (workflowIds.length > 0) {
+        const activeWorkflowId = workflowIds[0];
+        useWorkflowRegistry.setState({ activeWorkflowId });
+        
+        // Update workflow store with the workflow state
+        const activeWorkflow = workflows[activeWorkflowId];
+        if (activeWorkflow && activeWorkflow.state) {
+          // Validate the state has the minimum required properties
+          const blocks = activeWorkflow.state.blocks || {};
+          const edges = Array.isArray(activeWorkflow.state.edges) ? activeWorkflow.state.edges : [];
+          const loops = activeWorkflow.state.loops || {};
+          
+          // Use setState directly to update workflow state
+          useWorkflowStore.setState({
+            ...useWorkflowStore.getState(),
+            blocks,
+            edges,
+            loops,
+            isDeployed: activeWorkflow.state.isDeployed || false,
+            deployedAt: activeWorkflow.state.deployedAt,
+            lastSaved: Date.now(),
+          });
+          
+          logger.info(`Set active workflow to ${activeWorkflowId} with ${Object.keys(blocks).length} blocks and ${edges.length} edges`);
+        } else {
+          logger.warn(`Active workflow ${activeWorkflowId} has no state or invalid state`);
+        }
+      } else {
+        logger.warn('No workflows found to set as active');
       }
-    }, 1000) // Increased to 1 second for more reliable state settling
+
+      // Mark that we've completed initial DB load
+      initialDBLoadComplete = true;
+      logger.info('Initial DB load completed successfully');
+    } finally {
+      // Mark loading as complete after a short delay to ensure state is properly processed
+      setTimeout(() => {
+        isLoadingFromDB = false;
+        loadingFromDBToken = null;
+        yjsSyncing = false;
+        logger.info('Database loading complete and flags reset');
+      }, 500);
+    }
+  } catch (error) {
+    logger.error('Error fetching workflows from DB:', error)
+    // Reset loading state in case of error
+    isLoadingFromDB = false
+    loadingFromDBToken = null
+    yjsSyncing = false;
+  }
+}
+
+/**
+ * Check if YJS is handling synchronization
+ * @returns true if YJS is handling sync, false otherwise
+ */
+export function isYjsSyncing(): boolean {
+  try {
+    // First check our internal flag
+    if (yjsSyncing) return true;
+    
+    // Check if YJS binding exists and is handling updates
+    const yjsBinding: any = getYjsBinding();
+    if (yjsBinding && typeof yjsBinding.constructor.isUpdatingFromYjs === 'function') {
+      return yjsBinding.constructor.isUpdatingFromYjs();
+    }
+    return false;
+  } catch (error) {
+    logger.error('Error checking YJS sync status:', error);
+    return false;
   }
 }
 
 // Syncs workflows to the database
-export const workflowSync = createSingletonSyncManager('workflow-sync', () => ({
-  endpoint: API_ENDPOINTS.WORKFLOW,
-  preparePayload: () => {
-    if (typeof window === 'undefined') return {}
+export const workflowSync = createSingletonSyncManager('workflow', () => ({
+  endpoint: '/api/db/workflow',
+  preparePayload: async () => {
+    // Skip sync if YJS is currently updating (to prevent sync loops)
+    if (isYjsSyncing()) {
+      logger.info('Skipping workflow sync, YJS is already handling it');
+      return { skipSync: true };
+    }
+    
+    // Skip sync if we're using YJS (YJS binding will handle database sync)
+    const yjs = getYjsBinding();
+    if (!isLocalStorageMode() && yjs) {
+      logger.info('YJS is handling synchronization, skipping workflow sync');
+      return { skipSync: true };
+    }
 
-    // Skip sync if we're currently loading from DB to prevent overwriting DB data
+    // Skip DB sync while actively loading from DB to prevent data overwrites
     if (isActivelyLoadingFromDB()) {
-      logger.info('Skipping workflow sync while loading from DB')
-      return { skipSync: true }
+      logger.info('Skipping sync while loading from DB');
+      return { skipSync: true };
     }
-
-    // Get all workflows with values
-    const workflowsData = getAllWorkflowsWithValues()
-
-    // Skip sync if there are no workflows to sync
-    if (Object.keys(workflowsData).length === 0) {
-      // Safety check: if registry has workflows but we're sending empty data, something is wrong
-      const registryWorkflows = useWorkflowRegistry.getState().workflows
-      if (Object.keys(registryWorkflows).length > 0) {
-        logger.warn('Potential data loss prevented: Registry has workflows but sync payload is empty')
-        return { skipSync: true }
+    
+    // Critical safety check: Do not sync empty workflows if we haven't completed initial DB load
+    // This prevents wiping out database workflows during initialization
+    const workflows = getAllWorkflowsWithValues();
+    
+    if (Object.keys(workflows).length === 0) {
+      if (!initialDBLoadComplete) {
+        logger.warn('Prevented potential data loss: Skipping sync of empty workflows before initial DB load');
+        return { skipSync: true };
       }
+      logger.warn('Syncing empty workflows set - this will clear all workflows in the database');
+    }
+    
+    // Ensure all workflows have proper structure
+    const validatedWorkflows: Record<string, any> = {};
+    
+    Object.entries(workflows).forEach(([id, workflow]) => {
+      if (!workflow) return;
       
-      logger.info('Skipping workflow sync - no workflows to sync')
-      return { skipSync: true }
-    }
-
-    return {
-      workflows: workflowsData,
-    }
+      // Ensure state has the required properties
+      const state = workflow.state || {};
+      validatedWorkflows[id] = {
+        ...workflow,
+        state: {
+          blocks: state.blocks || {},
+          edges: Array.isArray(state.edges) ? state.edges : [],
+          loops: state.loops || {},
+          isDeployed: state.isDeployed || false,
+          deployedAt: state.deployedAt || null,
+          lastSaved: Date.now()
+        }
+      };
+    });
+    
+    return { workflows: validatedWorkflows };
   },
-  method: 'POST',
-  syncOnInterval: true,
-  syncOnExit: true,
-  onSyncSuccess: async (data) => {
-    logger.info('Workflows synced to DB successfully')
-
-    // After successful sync to DB, update schedules for all workflows
-    try {
-      const workflowsData = getAllWorkflowsWithValues()
-      const currentWorkflowIds = new Set(Object.keys(workflowsData))
-
-      // Process each workflow to update its schedule if needed
-      const schedulePromises = Object.entries(workflowsData).map(async ([id, workflow]) => {
-        const isCurrentlyScheduled = hasSchedulingEnabled(workflow.state.blocks)
-        const wasScheduledBefore = scheduledWorkflows.has(id)
-
-        // Only update schedule if the scheduling status has changed or it's currently scheduled
-        // This ensures we update schedules when they change and cancel them when they're disabled
-        if (isCurrentlyScheduled || wasScheduledBefore) {
-          await updateWorkflowSchedule(id, workflow.state)
-        }
-      })
-
-      // Wait for all schedule updates to complete
-      await Promise.all(schedulePromises)
-
-      // Clean up tracking for workflows that no longer exist
-      for (const id of scheduledWorkflows) {
-        if (!currentWorkflowIds.has(id)) {
-          scheduledWorkflows.delete(id)
-        }
-      }
-    } catch (error) {
-      logger.error('Error updating workflow schedules:', { error })
-    }
+  onSyncSuccess: (response) => {
+    logger.info('Workflow sync successful')
+  },
+  onSyncError: (error) => {
+    logger.error('Workflow sync failed:', error)
   },
 }))

@@ -13,7 +13,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css'
 import { createLogger } from '@/lib/logs/console-logger'
 import { useGeneralStore } from '@/stores/settings/general/store'
-import { initializeSyncManagers, isSyncInitialized } from '@/stores/sync-registry'
+import { getYjsBinding, initializeSyncManagers, isSyncInitialized } from '@/stores/sync-registry'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
 import { useSubBlockStore } from '@/stores/workflows/subblock/store'
 import { useWorkflowStore } from '@/stores/workflows/workflow/store'
@@ -40,11 +40,13 @@ function WorkflowContent() {
   // State
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
   const [isInitialized, setIsInitialized] = useState(false)
+  const [isYjsInitialized, setIsYjsInitialized] = useState(false)
 
   // Hooks
   const params = useParams()
   const router = useRouter()
   const { project } = useReactFlow()
+  const workflowId = params.id as string
 
   // Store access
   const { workflows, setActiveWorkflow, createWorkflow } = useWorkflowRegistry()
@@ -70,6 +72,30 @@ function WorkflowContent() {
       }
     }
   }, [])
+
+  // Setup YJS for real-time collaboration
+  useEffect(() => {
+    if (!isInitialized || !workflowId) return
+
+    // Get YJS binding to enable real-time collaboration
+    const yjsBinding = getYjsBinding()
+    if (!yjsBinding) {
+      logger.warn('YJS binding not available for real-time collaboration')
+      return
+    }
+
+    // Set the active workflow in YJS
+    yjsBinding.setActiveWorkflow(workflowId)
+    setIsYjsInitialized(true)
+
+    // Log for debugging
+    logger.info(`Connected to real-time collaboration for workflow: ${workflowId}`)
+
+    // Cleanup function
+    return () => {
+      setIsYjsInitialized(false)
+    }
+  }, [isInitialized, workflowId])
 
   // Init workflow
   useEffect(() => {
@@ -111,6 +137,35 @@ function WorkflowContent() {
 
     validateAndNavigate()
   }, [params.id, workflows, setActiveWorkflow, createWorkflow, router, isInitialized])
+
+  // Hook to sync workflow changes to YJS
+  useEffect(() => {
+    if (!isYjsInitialized || !workflowId) return
+
+    // Only sync changes after initialization
+    const yjsBinding = getYjsBinding()
+    if (!yjsBinding) return
+
+    // Update YJS with the current workflow state
+    const currentWorkflow = workflows[workflowId]
+    if (!currentWorkflow) return
+
+    const workflowData = {
+      id: workflowId,
+      name: currentWorkflow.name,
+      description: currentWorkflow.description || '',
+      color: currentWorkflow.color || '#3972F6',
+      state: {
+        blocks,
+        edges,
+        loops,
+        lastSaved: Date.now(),
+      },
+    }
+
+    // Sync current state to YJS - debounced internally
+    yjsBinding.updateWorkflow(workflowId, workflowData)
+  }, [isYjsInitialized, workflowId, workflows, blocks, edges, loops])
 
   // Transform blocks and loops into ReactFlow nodes
   const nodes = useMemo(() => {
@@ -342,6 +397,29 @@ function WorkflowContent() {
       )
     }
   }, [setSubBlockValue])
+
+  // Add a listener for real-time updates
+  useEffect(() => {
+    if (!isYjsInitialized || !workflowId) return
+
+    // Set up a periodic check for YJS updates to force re-render if needed
+    // This ensures that if a change is missed in the normal flow, the UI will still update
+    const checkInterval = setInterval(() => {
+      const yjsBinding = getYjsBinding()
+      if (!yjsBinding) return
+
+      // Force a small state update to ensure the component re-renders
+      // This is important to make sure all real-time changes are reflected
+      useWorkflowStore.setState((state) => ({
+        ...state,
+        lastSaved: Date.now(),
+      }))
+    }, 2000)
+
+    return () => {
+      clearInterval(checkInterval)
+    }
+  }, [isYjsInitialized, workflowId])
 
   if (!isInitialized) return null
 

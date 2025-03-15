@@ -6,7 +6,7 @@ import { createLogger } from '@/lib/logs/console-logger'
 import { db } from '@/db'
 import { workflow } from '@/db/schema'
 
-const logger = createLogger('WorkflowAPI')
+const logger = createLogger('Workflow API')
 
 // Schema for workflow data
 const WorkflowStateSchema = z.object({
@@ -29,31 +29,49 @@ const WorkflowSchema = z.object({
   state: WorkflowStateSchema,
 })
 
+// Schema for sync payload
 const SyncPayloadSchema = z.object({
-  workflows: z.record(z.string(), WorkflowSchema),
+  workflows: z.record(z.any()),
 })
 
-export async function GET(request: Request) {
+export async function GET() {
   const requestId = crypto.randomUUID().slice(0, 8)
 
   try {
-    // Get the session directly in the API route
     const session = await getSession()
     if (!session?.user?.id) {
-      logger.warn(`[${requestId}] Unauthorized workflow access attempt`)
+      logger.warn(`[${requestId}] Unauthorized workflow fetch attempt`)
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const userId = session.user.id
+    // Get all workflows for the user from the database
+    const dbWorkflows = await db
+      .select()
+      .from(workflow)
+      .where(eq(workflow.userId, session.user.id))
 
-    // Fetch all workflows for the user
-    const workflows = await db.select().from(workflow).where(eq(workflow.userId, userId))
+    // Convert to the format expected by the client
+    const workflows = dbWorkflows.reduce((acc, w) => {
+      acc[w.id] = {
+        id: w.id,
+        name: w.name,
+        description: w.description || '',
+        color: w.color || '#3972F6',
+        state: w.state,
+        lastSynced: w.lastSynced,
+        isDeployed: w.isDeployed,
+        deployedAt: w.deployedAt,
+        apiKey: w.apiKey,
+        createdAt: w.createdAt,
+      }
+      return acc
+    }, {} as Record<string, any>)
 
-    // Return the workflows
-    return NextResponse.json({ data: workflows }, { status: 200 })
-  } catch (error: any) {
-    logger.error(`[${requestId}] Workflow fetch error`, error)
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    logger.info(`[${requestId}] Fetched ${Object.keys(workflows).length} workflows for user ${session.user.id}`)
+    return NextResponse.json({ workflows })
+  } catch (error) {
+    logger.error(`[${requestId}] Error fetching workflows:`, error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
@@ -71,30 +89,35 @@ export async function POST(req: NextRequest) {
 
     try {
       const { workflows: clientWorkflows } = SyncPayloadSchema.parse(body)
-
-      // CRITICAL SAFEGUARD: Prevent wiping out existing workflows
-      // If client is sending empty workflows object, first check if user has existing workflows
-      if (Object.keys(clientWorkflows).length === 0) {
-        const existingWorkflows = await db
-          .select()
-          .from(workflow)
-          .where(eq(workflow.userId, session.user.id))
-        
-        // If user has existing workflows, but client sends empty, reject the sync
-        if (existingWorkflows.length > 0) {
-          logger.warn(`[${requestId}] Prevented data loss: Client attempted to sync empty workflows while DB has ${existingWorkflows.length} workflows`)
-          return NextResponse.json({ 
-            error: 'Sync rejected to prevent data loss', 
-            message: 'Client sent empty workflows, but user has existing workflows in database'
-          }, { status: 409 })
-        }
-      }
-
-      // Get all workflows for the user from the database
+      
+      // Get existing workflows for comparison
       const dbWorkflows = await db
         .select()
         .from(workflow)
         .where(eq(workflow.userId, session.user.id))
+      
+      // Log the sync attempt for debugging
+      logger.info(`[${requestId}] Sync attempt: Client has ${Object.keys(clientWorkflows).length} workflows, DB has ${dbWorkflows.length} workflows`)
+
+      // CRITICAL SAFEGUARD: Prevent wiping out existing workflows
+      // This check prevents empty state syncs that would erase data
+      if (Object.keys(clientWorkflows).length === 0 && dbWorkflows.length > 0) {
+        logger.warn(`[${requestId}] Prevented data loss: Client attempted to sync empty workflows while DB has ${dbWorkflows.length} workflows`)
+        return NextResponse.json({ 
+          error: 'Sync rejected to prevent data loss', 
+          message: 'Client sent empty workflows, but user has existing workflows in database'
+        }, { status: 409 })
+      }
+      
+      // Another safeguard: If client has significantly fewer workflows than DB
+      // and we've previously received a sync with more workflows, this is suspicious
+      if (dbWorkflows.length > 3 && Object.keys(clientWorkflows).length < dbWorkflows.length / 2) {
+        logger.warn(`[${requestId}] Potential data loss detected: Client sent ${Object.keys(clientWorkflows).length} workflows, DB has ${dbWorkflows.length} workflows`)
+        return NextResponse.json({ 
+          error: 'Sync rejected due to suspicious workflow count reduction', 
+          message: 'Client is attempting to remove too many workflows at once'
+        }, { status: 409 })
+      }
 
       const now = new Date()
       const operations: Promise<any>[] = []
@@ -108,72 +131,64 @@ export async function POST(req: NextRequest) {
         processedIds.add(id)
         const dbWorkflow = dbWorkflowMap.get(id)
 
-        if (!dbWorkflow) {
-          // New workflow - create
+        if (dbWorkflow) {
+          // Update existing workflow
+          operations.push(
+            db
+              .update(workflow)
+              .set({
+                name: clientWorkflow.name,
+                description: clientWorkflow.description,
+                color: clientWorkflow.color,
+                state: clientWorkflow.state,
+                lastSynced: now,
+                isDeployed: clientWorkflow.isDeployed,
+                deployedAt: clientWorkflow.deployedAt,
+                apiKey: clientWorkflow.apiKey,
+              })
+              .where(eq(workflow.id, id))
+          )
+        } else {
+          // Create new workflow
           operations.push(
             db.insert(workflow).values({
-              id: clientWorkflow.id,
+              id,
               userId: session.user.id,
               name: clientWorkflow.name,
               description: clientWorkflow.description,
               color: clientWorkflow.color,
               state: clientWorkflow.state,
               lastSynced: now,
+              isDeployed: clientWorkflow.isDeployed,
+              deployedAt: clientWorkflow.deployedAt,
+              apiKey: clientWorkflow.apiKey,
               createdAt: now,
               updatedAt: now,
             })
           )
-        } else {
-          // Existing workflow - update if needed
-          const needsUpdate =
-            JSON.stringify(dbWorkflow.state) !== JSON.stringify(clientWorkflow.state) ||
-            dbWorkflow.name !== clientWorkflow.name ||
-            dbWorkflow.description !== clientWorkflow.description ||
-            dbWorkflow.color !== clientWorkflow.color
-
-          if (needsUpdate) {
-            operations.push(
-              db
-                .update(workflow)
-                .set({
-                  name: clientWorkflow.name,
-                  description: clientWorkflow.description,
-                  color: clientWorkflow.color,
-                  state: clientWorkflow.state,
-                  lastSynced: now,
-                  updatedAt: now,
-                })
-                .where(eq(workflow.id, id))
-            )
-          }
         }
       }
 
-      // Handle deletions - workflows in DB but not in client
-      for (const dbWorkflow of dbWorkflows) {
-        if (!processedIds.has(dbWorkflow.id)) {
-          operations.push(db.delete(workflow).where(eq(workflow.id, dbWorkflow.id)))
+      // Delete workflows that no longer exist in client state
+      for (const [id, dbWorkflow] of dbWorkflowMap.entries()) {
+        if (!processedIds.has(id)) {
+          operations.push(
+            db.delete(workflow).where(eq(workflow.id, id))
+          )
         }
       }
 
-      // Execute all operations in parallel
+      // Execute all operations
       await Promise.all(operations)
 
+      logger.info(`[${requestId}] Successfully synced ${Object.keys(clientWorkflows).length} workflows`)
       return NextResponse.json({ success: true })
-    } catch (validationError) {
-      if (validationError instanceof z.ZodError) {
-        logger.warn(`[${requestId}] Invalid workflow data`, {
-          errors: validationError.errors,
-        })
-        return NextResponse.json(
-          { error: 'Invalid request data', details: validationError.errors },
-          { status: 400 }
-        )
-      }
-      throw validationError
+    } catch (error) {
+      logger.error(`[${requestId}] Validation error:`, error)
+      return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
     }
   } catch (error) {
-    logger.error(`[${requestId}] Workflow sync error`, error)
-    return NextResponse.json({ error: 'Workflow sync failed' }, { status: 500 })
+    logger.error(`[${requestId}] Error syncing workflows:`, error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
