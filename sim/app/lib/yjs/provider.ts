@@ -3,12 +3,12 @@
 import { createLogger } from '@/lib/logs/console-logger'
 import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
-import { useSession } from '@/lib/auth-client'
+import { getClientSession } from '@/lib/auth-client'
 
 const logger = createLogger('YJS Provider')
 
-// Singleton instance
-let provider: WorkflowYjsProvider | null = null
+// Singleton instance per workflow
+const providers = new Map<string, WorkflowYjsProvider>()
 
 export class WorkflowYjsProvider {
   private doc: Y.Doc
@@ -17,32 +17,67 @@ export class WorkflowYjsProvider {
   private reconnectAttempts = 0
   private maxReconnectAttempts = 5
   private userId: string | null = null
+  private workflowId: string | null = null
   private isDestroyed = false
+  private connectionPromise: Promise<void> | null = null
 
-  private constructor() {
+  private constructor(workflowId: string) {
     this.doc = new Y.Doc()
+    this.workflowId = workflowId
   }
 
-  static getInstance(): WorkflowYjsProvider {
-    if (!provider) {
-      provider = new WorkflowYjsProvider()
+  static getInstance(workflowId?: string): WorkflowYjsProvider {
+    if (!workflowId) {
+      throw new Error('WorkflowId is required to get a YJS provider instance')
     }
-    return provider
+    
+    if (!providers.has(workflowId)) {
+      providers.set(workflowId, new WorkflowYjsProvider(workflowId))
+    }
+    
+    return providers.get(workflowId)!
+  }
+
+  static cleanup(workflowId?: string): void {
+    if (workflowId) {
+      // Clean up specific provider
+      const provider = providers.get(workflowId)
+      if (provider) {
+        provider.disconnect()
+        providers.delete(workflowId)
+      }
+    } else {
+      // Clean up all providers
+      providers.forEach(provider => provider.disconnect())
+      providers.clear()
+    }
   }
 
   async connect(): Promise<void> {
     if (this.isConnected || this.isDestroyed) return
+    
+    // If already connecting, return the existing promise
+    if (this.connectionPromise) {
+      return this.connectionPromise
+    }
 
+    // Create a new connection promise
+    this.connectionPromise = this._connect()
+    return this.connectionPromise
+  }
+
+  private async _connect(): Promise<void> {
     try {
-      const session = await useSession()
+      // Use getClientSession instead of useSession to avoid React hooks in non-React contexts
+      const session = await getClientSession()
       if (!session?.data?.user?.id) {
         throw new Error('User not authenticated')
       }
 
       this.userId = session.data.user.id
       
-      // Use a consistent document name for the user to ensure all tabs share the same state
-      const roomName = `user-${session.data.user.id}`
+      // Use workflow-specific room name for collaboration
+      const roomName = `workflow-${this.workflowId}`
       
       // Disconnect existing provider if it exists
       if (this.wsProvider) {
@@ -50,7 +85,7 @@ export class WorkflowYjsProvider {
         this.wsProvider = null
       }
 
-      // Connect to WebSocket server with user-specific room
+      // Connect to WebSocket server with workflow-specific room
       this.wsProvider = new WebsocketProvider(
         process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:1234',
         roomName,
@@ -107,9 +142,14 @@ export class WorkflowYjsProvider {
 
         this.wsProvider?.on('status', statusHandler)
       })
+      
+      // Reset connection promise once completed
+      this.connectionPromise = null
     } catch (error) {
       logger.error('Failed to connect to YJS:', error)
       this.handleReconnect()
+      // Reset connection promise on error
+      this.connectionPromise = null
       throw error
     }
   }
@@ -143,6 +183,10 @@ export class WorkflowYjsProvider {
 
   getUserId(): string | null {
     return this.userId
+  }
+
+  getWorkflowId(): string | null {
+    return this.workflowId
   }
 
   isConnectedToServer(): boolean {

@@ -6,6 +6,7 @@ import { isLocalStorageMode } from './sync-core'
 import { fetchWorkflowsFromDB, workflowSync } from './workflows/sync'
 import { WorkflowYjsProvider } from '@/lib/yjs/provider'
 import { WorkflowYjsBinding } from '@/lib/yjs/workflow-binding'
+import { useWorkflowRegistry } from './workflows/registry/store'
 
 const logger = createLogger('Sync Registry')
 
@@ -43,35 +44,47 @@ export async function initializeSyncManagers(): Promise<boolean> {
     // Initialize sync managers first
     managers = [workflowSync]
     
-    // Connect to YJS, but don't initialize binding yet
-    let yjsProvider;
-    try {
-      yjsProvider = WorkflowYjsProvider.getInstance()
-      await yjsProvider.connect()
-      logger.info('Connected to YJS provider')
-    } catch (error) {
-      logger.error('Failed to connect to YJS:', error)
-    }
+    // Create YJS binding
+    yjsBinding = new WorkflowYjsBinding()
     
     // Fetch data from database
     try {
       await fetchWorkflowsFromDB()
       logger.info('Successfully loaded workflows from database')
+      
+      // Initialize YJS for the active workflow if one exists
+      const registry = useWorkflowRegistry.getState();
+      const activeWorkflowId = registry.activeWorkflowId;
+      
+      if (activeWorkflowId && yjsBinding) {
+        await yjsBinding.initializeWorkflow(activeWorkflowId);
+        logger.info(`Initialized YJS for active workflow: ${activeWorkflowId}`);
+        
+        // Sync active workflow to YJS
+        await yjsBinding.syncWorkflowToYJS(activeWorkflowId);
+        
+        // Also initialize all other workflows in the registry
+        const workflowIds = Object.keys(registry.workflows);
+        if (workflowIds.length > 1) {
+          // Initialize other workflows in the background
+          Promise.all(
+            workflowIds
+              .filter(id => id !== activeWorkflowId)
+              .map(async (id) => {
+                await yjsBinding?.initializeWorkflow(id);
+                await yjsBinding?.syncWorkflowToYJS(id);
+                logger.info(`Initialized YJS for workflow: ${id}`);
+              })
+          ).catch(error => {
+            logger.error('Error initializing additional workflows:', error);
+          });
+        }
+      }
+      
+      // Mark the binding as fully initialized
+      yjsBinding?.markInitialized();
     } catch (error) {
       logger.error('Error fetching data from DB:', { error })
-    }
-
-    // Now initialize YJS binding after DB data is loaded
-    if (yjsProvider) {
-      yjsBinding = new WorkflowYjsBinding()
-      
-      // Mark YJS as initialized after a delay to ensure all DB data is processed
-      setTimeout(() => {
-        if (yjsBinding) {
-          yjsBinding.markInitialized()
-          logger.info('YJS binding has been initialized and synchronized')
-        }
-      }, 1000);
     }
 
     initialized = true;
@@ -118,7 +131,25 @@ export function resetSyncManagers(): void {
     yjsBinding.dispose()
     yjsBinding = null
   }
+  
+  // Clean up all YJS providers
+  WorkflowYjsProvider.cleanup()
 }
 
 // Export individual sync managers for direct use
 export { workflowSync }
+
+/**
+ * Initialize or get YJS for a specific workflow
+ * This ensures each workflow has its own YJS connection
+ */
+export async function getYjsForWorkflow(workflowId: string): Promise<boolean> {
+  if (!yjsBinding || !workflowId) return false;
+  
+  try {
+    return await yjsBinding.initializeWorkflow(workflowId);
+  } catch (error) {
+    logger.error(`Failed to initialize YJS for workflow ${workflowId}:`, error);
+    return false;
+  }
+}

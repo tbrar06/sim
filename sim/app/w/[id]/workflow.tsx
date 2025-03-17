@@ -77,22 +77,65 @@ function WorkflowContent() {
   useEffect(() => {
     if (!isInitialized || !workflowId) return
 
-    // Get YJS binding to enable real-time collaboration
-    const yjsBinding = getYjsBinding()
-    if (!yjsBinding) {
-      logger.warn('YJS binding not available for real-time collaboration')
-      return
+    let isMounted = true
+    let retryCount = 0
+    const maxRetries = 3
+
+    const initializeCollaboration = async () => {
+      try {
+        // Get YJS binding
+        const binding = getYjsBinding()
+        if (!binding) {
+          logger.warn('YJS binding not available for real-time collaboration')
+          return
+        }
+
+        logger.info(`Initializing YJS collaboration for workflow: ${workflowId}`)
+
+        // Initialize workflow-specific YJS
+        const initSuccess = await binding.initializeWorkflow(workflowId)
+        if (!initSuccess) {
+          throw new Error(`Failed to initialize YJS for workflow: ${workflowId}`)
+        }
+
+        // Make this the active workflow
+        await binding.setActiveWorkflow(workflowId)
+
+        // Sync current state to YJS
+        await binding.syncWorkflowToYJS(workflowId)
+
+        // Update UI state if component still mounted
+        if (isMounted) {
+          setIsYjsInitialized(true)
+          logger.info(
+            `Successfully connected to real-time collaboration for workflow: ${workflowId}`
+          )
+        }
+      } catch (error) {
+        logger.error(`Error initializing collaboration for workflow ${workflowId}:`, error)
+
+        // Implement retry with exponential backoff
+        if (retryCount < maxRetries && isMounted) {
+          const delay = Math.pow(2, retryCount) * 1000
+          retryCount++
+          logger.info(`Retrying YJS initialization (${retryCount}/${maxRetries}) in ${delay}ms...`)
+          setTimeout(initializeCollaboration, delay)
+        }
+      }
     }
 
-    // Set the active workflow in YJS
-    yjsBinding.setActiveWorkflow(workflowId)
-    setIsYjsInitialized(true)
-
-    // Log for debugging
-    logger.info(`Connected to real-time collaboration for workflow: ${workflowId}`)
+    // Initialize collaboration
+    initializeCollaboration()
 
     // Cleanup function
     return () => {
+      isMounted = false
+      // Only clean up if we're changing workflows, not unmounting the component
+      if (getYjsBinding()) {
+        // We don't disconnect here - let the YJS binding manager handle that
+        // to support persistence across navigation
+      }
+
       setIsYjsInitialized(false)
     }
   }, [isInitialized, workflowId])
@@ -142,30 +185,36 @@ function WorkflowContent() {
   useEffect(() => {
     if (!isYjsInitialized || !workflowId) return
 
+    // Skip redundant updates
+    if (!blocks || Object.keys(blocks).length === 0) return
+
     // Only sync changes after initialization
     const yjsBinding = getYjsBinding()
-    if (!yjsBinding) return
-
-    // Update YJS with the current workflow state
-    const currentWorkflow = workflows[workflowId]
-    if (!currentWorkflow) return
-
-    const workflowData = {
-      id: workflowId,
-      name: currentWorkflow.name,
-      description: currentWorkflow.description || '',
-      color: currentWorkflow.color || '#3972F6',
-      state: {
-        blocks,
-        edges,
-        loops,
-        lastSaved: Date.now(),
-      },
+    if (!yjsBinding) {
+      logger.warn('Cannot sync to YJS: binding not available')
+      return
     }
 
-    // Sync current state to YJS - debounced internally
-    yjsBinding.updateWorkflow(workflowId, workflowData)
-  }, [isYjsInitialized, workflowId, workflows, blocks, edges, loops])
+    logger.info(`Syncing workflow state to YJS: ${workflowId}`)
+
+    // Update YJS with the current workflow state
+    const state = {
+      blocks,
+      edges,
+      loops,
+      lastSaved: Date.now(),
+    }
+
+    // Use a debounced sync to avoid too many updates
+    const timerId = setTimeout(() => {
+      // Sync current state to YJS - internally handles debouncing to database
+      yjsBinding
+        .updateWorkflowState(workflowId, state)
+        .catch((error) => logger.error('Failed to sync workflow state to YJS:', error))
+    }, 500)
+
+    return () => clearTimeout(timerId)
+  }, [isYjsInitialized, workflowId, blocks, edges, loops])
 
   // Transform blocks and loops into ReactFlow nodes
   const nodes = useMemo(() => {
