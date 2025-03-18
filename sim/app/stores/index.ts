@@ -6,7 +6,7 @@ import { useCustomToolsStore } from './custom-tools/store'
 import { useExecutionStore } from './execution/store'
 import { useNotificationStore } from './notifications/store'
 import { useEnvironmentStore } from './settings/environment/store'
-import { getSyncManagers, initializeSyncManagers, resetSyncManagers } from './sync-registry'
+import { getSyncManagers, initializeSyncManagers, resetSyncManagers, workflowSync } from './sync-registry'
 import {
   loadRegistry,
   loadSubblockValues,
@@ -17,6 +17,7 @@ import {
 import { useWorkflowRegistry } from './workflows/registry/store'
 import { useSubBlockStore } from './workflows/subblock/store'
 import { useWorkflowStore } from './workflows/workflow/store'
+import { isLocalStorageMode } from './sync-core'
 
 const logger = createLogger('Stores')
 
@@ -37,16 +38,21 @@ async function initializeApplication(): Promise<void> {
   isInitializing = true
 
   try {
-    // Load environment variables directly from DB
-    await useEnvironmentStore.getState().loadEnvironmentVariables()
-
     // Set a flag in sessionStorage to detect new login sessions
     // This helps identify fresh logins in private browsers
     const isNewLoginSession = !sessionStorage.getItem('app_initialized')
     sessionStorage.setItem('app_initialized', 'true')
 
-    // Initialize sync system for other stores
-    await initializeSyncManagers()
+    // Load environment variables first
+    await useEnvironmentStore.getState().loadEnvironmentVariables()
+    logger.info('Environment variables loaded successfully');
+
+    // Initialize sync system for other stores - this loads data from DB
+    const syncInitialized = await initializeSyncManagers()
+    if (!syncInitialized) {
+      logger.error('Failed to initialize sync system');
+      throw new Error('Sync system initialization failed');
+    }
 
     // After DB sync, check if we need to load from localStorage
     // This is a fallback in case DB sync failed or there's no data in DB
@@ -58,11 +64,23 @@ async function initializeApplication(): Promise<void> {
       const workflows = loadRegistry()
       if (workflows && Object.keys(workflows).length > 0) {
         logger.info('Loading workflows from localStorage as fallback')
+        
+        // Set workflows in registry
         useWorkflowRegistry.setState({ workflows })
 
-        const activeWorkflowId = useWorkflowRegistry.getState().activeWorkflowId
+        // Initialize active workflow if one exists
+        const activeWorkflowId = registryState.activeWorkflowId
         if (activeWorkflowId) {
+          logger.info(`Initializing workflow state for ${activeWorkflowId} from localStorage`);
           initializeWorkflowState(activeWorkflowId)
+        }
+
+        // Trigger sync to DB after loading from localStorage
+        if (!isLocalStorageMode()) {
+          logger.info('Triggering DB sync after loading from localStorage');
+          setTimeout(() => {
+            workflowSync.sync();
+          }, 1000);
         }
       } else if (isNewLoginSession) {
         // Critical safeguard: For new login sessions with no DB workflows 
@@ -72,7 +90,13 @@ async function initializeApplication(): Promise<void> {
         syncManagers.forEach(manager => manager.stopIntervalSync())
       }
     } else {
-      logger.info('Using workflows loaded from DB, ignoring localStorage')
+      logger.info(`Using ${Object.keys(registryState.workflows).length} workflows loaded from DB, ignoring localStorage`)
+      
+      // Wait before allowing syncs after DB load to prevent race conditions
+      // This is important to prevent overwriting data during page loads
+      setTimeout(() => {
+        logger.info('Sync system fully ready for synchronization');
+      }, 1000);
     }
 
     // 2. Register cleanup
@@ -117,39 +141,53 @@ function initializeWorkflowState(workflowId: string): void {
  * Handle application cleanup before unload
  */
 function handleBeforeUnload(event: BeforeUnloadEvent): void {
-  // 1. Persist current state
-  const currentId = useWorkflowRegistry.getState().activeWorkflowId
-  if (currentId) {
-    const currentState = useWorkflowStore.getState()
-
-    // Save the current workflow state with its ID
-    saveWorkflowState(currentId, {
-      blocks: currentState.blocks,
-      edges: currentState.edges,
-      loops: currentState.loops,
-      isDeployed: currentState.isDeployed,
-      deployedAt: currentState.deployedAt,
-      lastSaved: Date.now(),
-      // Include history for undo/redo functionality
-      history: currentState.history,
-    })
-
-    // Save subblock values for the current workflow
-    const subblockValues = useSubBlockStore.getState().workflowValues[currentId]
-    if (subblockValues) {
-      saveSubblockValues(currentId, subblockValues)
-    }
+  // Don't attempt to save anything if the app isn't initialized
+  if (isInitializing) {
+    return;
   }
+  
+  try {
+    // 1. Persist current state to localStorage
+    const currentId = useWorkflowRegistry.getState().activeWorkflowId
+    if (currentId) {
+      const currentState = useWorkflowStore.getState()
 
-  // 2. Final sync for managers that need it
-  getSyncManagers()
-    .filter((manager) => manager.config.syncOnExit)
-    .forEach((manager) => {
-      manager.sync()
-    })
+      // Save the current workflow state with its ID
+      saveWorkflowState(currentId, {
+        blocks: currentState.blocks,
+        edges: currentState.edges,
+        loops: currentState.loops,
+        isDeployed: currentState.isDeployed,
+        deployedAt: currentState.deployedAt,
+        lastSaved: Date.now(),
+        // Include history for undo/redo functionality
+        history: currentState.history,
+      })
 
-  // 3. Cleanup managers
-  getSyncManagers().forEach((manager) => manager.dispose())
+      // Save subblock values for the current workflow
+      const subblockValues = useSubBlockStore.getState().workflowValues[currentId]
+      if (subblockValues) {
+        saveSubblockValues(currentId, subblockValues)
+      }
+      
+      logger.info(`Saved workflow state for ${currentId} before unload`);
+    }
+
+    // 2. Final sync for managers that need it - this is synchronous
+    getSyncManagers()
+      .filter((manager) => manager.config.syncOnExit)
+      .forEach((manager) => {
+        try {
+          manager.sync()
+        } catch (error) {
+          logger.error('Error during exit sync:', error);
+        }
+      })
+      
+    logger.info('Completed exit sync');
+  } catch (error) {
+    logger.error('Error during application cleanup:', error);
+  }
 
   // Standard beforeunload pattern
   event.preventDefault()

@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import ReactFlow, {
   Background,
@@ -41,6 +41,7 @@ function WorkflowContent() {
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
   const [isInitialized, setIsInitialized] = useState(false)
   const [isYjsInitialized, setIsYjsInitialized] = useState(false)
+  const syncTimeRef = useRef<number>(0)
 
   // Hooks
   const params = useParams()
@@ -140,53 +141,12 @@ function WorkflowContent() {
     }
   }, [isInitialized, workflowId])
 
-  // Init workflow
-  useEffect(() => {
-    if (!isInitialized) return
-
-    const validateAndNavigate = async () => {
-      const workflowIds = Object.keys(workflows)
-      const currentId = params.id as string
-
-      if (workflowIds.length === 0) {
-        // Create initial workflow using the centralized function
-        const newId = createWorkflow({ isInitial: true })
-        router.replace(`/w/${newId}`)
-        return
-      }
-
-      if (!workflows[currentId]) {
-        router.replace(`/w/${workflowIds[0]}`)
-        return
-      }
-
-      // Import the isActivelyLoadingFromDB function to check sync status
-      const { isActivelyLoadingFromDB } = await import('@/stores/workflows/sync')
-
-      // Wait for any active DB loading to complete before switching workflows
-      if (isActivelyLoadingFromDB()) {
-        logger.info('Waiting for DB loading to complete before switching workflow')
-        const checkInterval = setInterval(() => {
-          if (!isActivelyLoadingFromDB()) {
-            clearInterval(checkInterval)
-            setActiveWorkflow(currentId)
-          }
-        }, 100)
-        return
-      }
-
-      setActiveWorkflow(currentId)
-    }
-
-    validateAndNavigate()
-  }, [params.id, workflows, setActiveWorkflow, createWorkflow, router, isInitialized])
-
   // Hook to sync workflow changes to YJS
   useEffect(() => {
-    if (!isYjsInitialized || !workflowId) return
+    if (!isYjsInitialized || !workflowId || !blocks) return
 
-    // Skip redundant updates
-    if (!blocks || Object.keys(blocks).length === 0) return
+    // Skip redundant updates or updates during initialization
+    if (Object.keys(blocks).length === 0) return
 
     // Only sync changes after initialization
     const yjsBinding = getYjsBinding()
@@ -195,26 +155,101 @@ function WorkflowContent() {
       return
     }
 
-    logger.info(`Syncing workflow state to YJS: ${workflowId}`)
+    const currentTime = Date.now()
 
-    // Update YJS with the current workflow state
-    const state = {
-      blocks,
-      edges,
-      loops,
-      lastSaved: Date.now(),
+    // Skip if we just synced very recently (debounce)
+    if (currentTime - syncTimeRef.current < 500) {
+      return
     }
 
-    // Use a debounced sync to avoid too many updates
-    const timerId = setTimeout(() => {
-      // Sync current state to YJS - internally handles debouncing to database
-      yjsBinding
-        .updateWorkflowState(workflowId, state)
-        .catch((error) => logger.error('Failed to sync workflow state to YJS:', error))
-    }, 500)
+    // Create a sync operation with proper error handling
+    const syncToYJS = async () => {
+      try {
+        logger.info(`Syncing workflow state to YJS: ${workflowId}`)
+
+        // Get latest state with deep cloning to prevent reference issues
+        const currentState = {
+          blocks: JSON.parse(JSON.stringify(blocks)),
+          edges: JSON.parse(JSON.stringify(edges)),
+          loops: JSON.parse(JSON.stringify(loops)),
+          lastSaved: currentTime,
+        }
+
+        // Update YJS with the current workflow state
+        await yjsBinding.updateWorkflowState(workflowId, currentState)
+
+        // Track successful sync time
+        syncTimeRef.current = currentTime
+        logger.info(`Successfully synced workflow ${workflowId} to YJS`)
+      } catch (error) {
+        logger.error('Failed to sync workflow state to YJS:', error)
+      }
+    }
+
+    // Use a slight delay to batch multiple rapid state changes
+    const timerId = setTimeout(syncToYJS, 300)
 
     return () => clearTimeout(timerId)
   }, [isYjsInitialized, workflowId, blocks, edges, loops])
+
+  // Init workflow on route/param change
+  useEffect(() => {
+    if (!isInitialized) return
+
+    const validateAndNavigate = async () => {
+      try {
+        const workflowIds = Object.keys(workflows)
+        const currentId = params.id as string
+
+        // Handle empty workflow registry
+        if (workflowIds.length === 0) {
+          logger.info('No workflows found, creating initial workflow')
+          const newId = createWorkflow({ isInitial: true })
+          router.replace(`/w/${newId}`)
+          return
+        }
+
+        // Handle invalid workflow ID
+        if (!workflows[currentId]) {
+          logger.info(`Invalid workflow ID: ${currentId}, redirecting to first available workflow`)
+          router.replace(`/w/${workflowIds[0]}`)
+          return
+        }
+
+        // Import the isActivelyLoadingFromDB function to check sync status
+        const { isActivelyLoadingFromDB } = await import('@/stores/workflows/sync')
+
+        // Wait for any active DB loading to complete before switching workflows
+        if (isActivelyLoadingFromDB()) {
+          logger.info('Waiting for DB loading to complete before switching workflow')
+
+          // Poll until loading is complete
+          let attempts = 0
+          const maxAttempts = 50 // 5 seconds max wait
+
+          const waitForLoading = () => {
+            if (!isActivelyLoadingFromDB() || attempts >= maxAttempts) {
+              setActiveWorkflow(currentId)
+            } else {
+              attempts++
+              setTimeout(waitForLoading, 100)
+            }
+          }
+
+          waitForLoading()
+          return
+        }
+
+        // Activate the workflow
+        logger.info(`Setting active workflow to: ${currentId}`)
+        await setActiveWorkflow(currentId)
+      } catch (error) {
+        logger.error('Error during workflow initialization:', error)
+      }
+    }
+
+    validateAndNavigate()
+  }, [params.id, workflows, setActiveWorkflow, createWorkflow, router, isInitialized])
 
   // Transform blocks and loops into ReactFlow nodes
   const nodes = useMemo(() => {

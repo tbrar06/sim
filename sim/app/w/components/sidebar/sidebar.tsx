@@ -8,10 +8,13 @@ import { HelpCircle, Plus, ScrollText, Settings } from 'lucide-react'
 import { AgentIcon } from '@/components/icons'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { createLogger } from '@/lib/logs/console-logger'
 import { useWorkflowRegistry } from '@/stores/workflows/registry/store'
 import { HelpModal } from './components/help-modal/help-modal'
 import { NavItem } from './components/nav-item/nav-item'
 import { SettingsModal } from './components/settings-modal/settings-modal'
+
+const logger = createLogger('Sidebar')
 
 export function Sidebar() {
   const { workflows, createWorkflow } = useWorkflowRegistry()
@@ -19,6 +22,7 @@ export function Sidebar() {
   const pathname = usePathname()
   const [showSettings, setShowSettings] = useState(false)
   const [showHelp, setShowHelp] = useState(false)
+  const [isCreatingWorkflow, setIsCreatingWorkflow] = useState(false)
 
   // Sort workflows by lastModified date (which corresponds to createdAt for new workflows)
   // Newest workflows at the bottom (ascending order by date)
@@ -39,20 +43,65 @@ export function Sidebar() {
 
   // Create workflow
   const handleCreateWorkflow = async () => {
+    // Prevent multiple workflow creation attempts
+    if (isCreatingWorkflow) {
+      logger.info('Workflow creation already in progress, please wait...')
+      return
+    }
+
     try {
+      setIsCreatingWorkflow(true)
+
       // Import the isActivelyLoadingFromDB function to check sync status
-      const { isActivelyLoadingFromDB } = await import('@/stores/workflows/sync')
+      const { isActivelyLoadingFromDB, ensureSyncComplete } = await import(
+        '@/stores/workflows/sync'
+      )
 
       // Prevent creating workflows during active DB operations
       if (isActivelyLoadingFromDB()) {
-        console.log('Please wait, syncing in progress...')
-        return
+        logger.info('Please wait, syncing in progress...')
+        // Wait for sync to complete before proceeding
+        await ensureSyncComplete()
       }
 
-      const id = createWorkflow()
+      // Get the getYjsBinding function to ensure YJS is initialized
+      const { getYjsBinding, initializeSyncManagers } = await import('@/stores/sync-registry')
+
+      // Make sure YJS is initialized before creating workflow
+      if (!getYjsBinding()) {
+        logger.info('Initializing sync system before creating workflow...')
+        await initializeSyncManagers()
+      }
+
+      // Create the workflow with proper metadata
+      const workflowName = `Workflow ${Object.keys(workflows).length + 1}`
+      // Create the workflow (using only the parameters that the function accepts)
+      const id = createWorkflow({ isInitial: true })
+
+      // Update the workflow immediately after creation with metadata
+      try {
+        useWorkflowRegistry.getState().updateWorkflow(id, {
+          id,
+          name: workflowName,
+          lastModified: new Date(),
+          color: '#3972F6',
+        })
+      } catch (e) {
+        logger.error('Error updating workflow metadata:', e)
+      }
+
+      logger.info(`Created new workflow with ID: ${id}`)
+
+      // Force a sync right after creating the workflow
+      const { syncNow } = await import('@/stores/workflows/sync')
+      await syncNow()
+
+      // Navigate to the new workflow
       router.push(`/w/${id}`)
     } catch (error) {
-      console.error('Error creating workflow:', error)
+      logger.error('Error creating workflow:', error)
+    } finally {
+      setIsCreatingWorkflow(false)
     }
   }
 
@@ -73,6 +122,7 @@ export function Sidebar() {
               size="icon"
               onClick={handleCreateWorkflow}
               className="h-9 w-9 md:h-8 md:w-8"
+              disabled={isCreatingWorkflow}
             >
               <Plus className="h-5 w-5" />
               <span className="sr-only">Add Workflow</span>
