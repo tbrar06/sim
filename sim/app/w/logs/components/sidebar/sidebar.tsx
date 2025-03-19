@@ -24,7 +24,7 @@ interface LogSidebarProps {
 /**
  * Formats JSON content for display, handling multiple JSON objects separated by '--'
  */
-const formatJsonContent = (content: string): JSX.Element => {
+const formatJsonContent = (content: string): React.ReactNode => {
   // Check if the content has multiple parts separated by '--'
   const parts = content.split(/\s*--\s*/g).filter((part) => part.trim().length > 0)
 
@@ -48,7 +48,7 @@ const formatJsonContent = (content: string): JSX.Element => {
 /**
  * Formats a single JSON content part
  */
-const formatSingleJsonContent = (content: string): JSX.Element => {
+const formatSingleJsonContent = (content: string): React.ReactNode => {
   try {
     // Try to parse the content as JSON
     const jsonStart = content.indexOf('{')
